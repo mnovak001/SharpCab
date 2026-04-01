@@ -6,7 +6,7 @@
         <Nullable>enable</Nullable>
 
 
-        <PackageId>MagikaSharp</PackageId>
+        <PackageId>SharpCab</PackageId>
         <Authors>Michal Novák</Authors>
         <Description>.NET wrapper over CLI tool cabextract</Description>
 
