@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+
+
+        <PackageId>MagikaSharp</PackageId>
+        <Authors>Michal Novák</Authors>
+        <Description>.NET wrapper over CLI tool cabextract</Description>
+
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+
+        <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+        <EnableDefaultContentItems>false</EnableDefaultContentItems>
+
+        <PackageProjectUrl>https://github.com/mnovak001/SharpCab</PackageProjectUrl>
+
+        <RepositoryUrl>https://github.com/mnovak001/SharpCab</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="../../LICENSE" Pack="true" PackagePath="" />
+        <None Include="../../README.md" Pack="true" PackagePath="" />
+    </ItemGroup>
+
+</Project>
