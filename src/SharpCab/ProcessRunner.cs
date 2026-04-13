@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 
 namespace SharpCab;
 
@@ -10,21 +11,7 @@ internal sealed class ProcessRunner
         string? workingDirectory = null,
         CancellationToken cancellationToken = default)
     {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = fileName,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            RedirectStandardInput = false,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WorkingDirectory = workingDirectory ?? Environment.CurrentDirectory
-        };
-
-        foreach (var argument in arguments)
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
+        var startInfo = CreateStartInfo(fileName, arguments, workingDirectory);
 
         using var process = new Process
         {
@@ -33,9 +20,7 @@ internal sealed class ProcessRunner
         };
 
         if (!process.Start())
-        {
             throw new InvalidOperationException($"Failed to start process '{fileName}'.");
-        }
 
         Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         Task<string> stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
@@ -49,11 +34,34 @@ internal sealed class ProcessRunner
             await stderrTask.ConfigureAwait(false));
     }
 
-    public async Task<ProcessBinaryRunResult> RunForBytesAsync(
+    public Task<Stream> RunForStreamAsync(
         string fileName,
         IReadOnlyList<string> arguments,
         string? workingDirectory = null,
         CancellationToken cancellationToken = default)
+    {
+        var startInfo = CreateStartInfo(fileName, arguments, workingDirectory);
+
+        var process = new Process
+        {
+            StartInfo = startInfo,
+            EnableRaisingEvents = true
+        };
+
+        if (!process.Start())
+        {
+            process.Dispose();
+            throw new InvalidOperationException($"Failed to start process '{fileName}'.");
+        }
+
+        return Task.FromResult<Stream>(
+            new ProcessOutputStream(process, fileName, arguments, cancellationToken));
+    }
+
+    private static ProcessStartInfo CreateStartInfo(
+        string fileName,
+        IReadOnlyList<string> arguments,
+        string? workingDirectory)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -67,31 +75,8 @@ internal sealed class ProcessRunner
         };
 
         foreach (var argument in arguments)
-        {
             startInfo.ArgumentList.Add(argument);
-        }
 
-        using var process = new Process
-        {
-            StartInfo = startInfo,
-            EnableRaisingEvents = true
-        };
-
-        if (!process.Start())
-        {
-            throw new InvalidOperationException($"Failed to start process '{fileName}'.");
-        }
-
-        await using var stdout = new MemoryStream();
-        Task copyStdoutTask = process.StandardOutput.BaseStream.CopyToAsync(stdout, cancellationToken);
-        Task<string> stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-        Task waitForExitTask = process.WaitForExitAsync(cancellationToken);
-
-        await Task.WhenAll(copyStdoutTask, stderrTask, waitForExitTask).ConfigureAwait(false);
-
-        return new ProcessBinaryRunResult(
-            process.ExitCode,
-            stdout.ToArray(),
-            await stderrTask.ConfigureAwait(false));
+        return startInfo;
     }
 }

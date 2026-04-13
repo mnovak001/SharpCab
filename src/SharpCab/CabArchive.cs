@@ -50,11 +50,10 @@ public class CabArchive : IDisposable
             throw new ArgumentException("Entry name is required.", nameof(entryName));
 
         var args = new[] { "-p", "-F", entryName, _archivePath };
-        var result = await _processRunner.RunForBytesAsync("cabextract", args, cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
-        result.EnsureSuccess("cabextract", args);
 
-        return new MemoryStream(result.StandardOutputBytes, writable: false);
+        return await _processRunner
+            .RunForStreamAsync("cabextract", args, cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private IReadOnlyList<CabEntry> ParseEntries(string stdout)
