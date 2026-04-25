@@ -26,6 +26,14 @@
     <ItemGroup>
         <None Include="../../LICENSE" Pack="true" PackagePath="" />
         <None Include="../../README.md" Pack="true" PackagePath="" />
+
+        <None Include="runtimes/linux-x64/native/libmspack.so"
+              Pack="true"
+              PackagePath="runtimes/linux-x64/native/" />
+
+        <None Include="runtimes/linux-arm64/native/libmspack.so"
+              Pack="true"
+              PackagePath="runtimes/linux-arm64/native/" />
     </ItemGroup>
 
 </Project>

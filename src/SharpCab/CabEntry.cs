@@ -1,13 +1,21 @@
 namespace SharpCab;
 
-public class CabEntry(string name, long fileSize, DateTime dateTime, CabArchive parent)
+public sealed class CabEntry
 {
-    public string Name { get; } = name;
-    public long FileSize { get; } = fileSize;
-    public DateTime DateTime { get; } = dateTime;
+    internal CabArchive Archive { get; }
+    internal IntPtr NativeFile { get; }
 
-    public Task<Stream> OpenAsync(CancellationToken cancellationToken = default)
+    public string Name { get; }
+    public long Length { get; }
+
+    internal CabEntry(CabArchive archive, IntPtr nativeFile, string name, long length)
     {
-        return parent.OpenEntryAsync(Name, cancellationToken);
+        Archive = archive;
+        NativeFile = nativeFile;
+        Name = name;
+        Length = length;
     }
+
+    public ValueTask<Stream> OpenStreamAsync(CancellationToken cancellationToken = default)
+        => Archive.OpenEntryStreamAsync(NativeFile, Name, cancellationToken);
 }
