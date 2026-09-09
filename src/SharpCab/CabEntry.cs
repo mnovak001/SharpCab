@@ -17,5 +17,5 @@ public sealed class CabEntry
     }
 
     public ValueTask<Stream> OpenStreamAsync(CancellationToken cancellationToken = default)
-        => Archive.OpenEntryStreamAsync(NativeFile, Name, cancellationToken);
+        => Archive.OpenEntryStreamAsync(NativeFile, Name, Length, cancellationToken);
 }

@@ -1,71 +1,73 @@
-﻿using System.Runtime.InteropServices;
-using System.Text;
+using System.IO.Pipelines;
+using System.Runtime.InteropServices;
 
 namespace SharpCab;
 
 public sealed class CabArchive : IAsyncDisposable
 {
-    private readonly string _cabPath;
-    private readonly bool _deleteCabOnDispose;
-    private readonly List<string> _tempFiles = new();
-
+    private readonly Stream _input;
+    private readonly bool _ownsInput;
+    private GCHandle _inputHandle;
+    private IntPtr _inputToken; // libmspack keeps this pointer as cabinet->filename, so it must outlive _cab
     private IntPtr _cabd;
     private IntPtr _cab;
-    private IntPtr _cabPathUtf8;
+    private CabEntryStream? _current;
+    private Task? _extract;
     private bool _disposed;
-    private bool _entryOpen;
 
-    private CabArchive(string cabPath, bool deleteCabOnDispose)
+    private CabArchive(Stream input, bool ownsInput)
     {
-        _cabPath = cabPath ?? throw new ArgumentNullException(nameof(cabPath));
-        _deleteCabOnDispose = deleteCabOnDispose;
+        _input = input;
+        _ownsInput = ownsInput;
     }
 
-    public static async ValueTask<CabArchive> OpenAsync(
-        Stream stream,
-        CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Opens a cabinet from a readable, seekable stream. Nothing is copied: libmspack reads and seeks the stream
+    /// directly, so the stream must stay open and untouched until the archive is disposed.
+    /// </summary>
+    public static ValueTask<CabArchive> OpenAsync(Stream stream, CancellationToken cancellationToken = default)
     {
-        if (stream is null)
-            throw new ArgumentNullException(nameof(stream));
-        if (!stream.CanRead)
-            throw new ArgumentException("Stream must be readable.", nameof(stream));
+        ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanRead || !stream.CanSeek)
+            throw new ArgumentException("Stream must be readable and seekable; CAB parsing seeks within the archive.", nameof(stream));
 
-        var tempCab = Path.Combine(Path.GetTempPath(), "sharpcab-" + Guid.NewGuid().ToString("N") + ".cab");
+        return ValueTask.FromResult(Open(stream, ownsInput: false));
+    }
 
+    public static ValueTask<CabArchive> OpenAsync(string path, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        return ValueTask.FromResult(Open(File.OpenRead(path), ownsInput: true));
+    }
+
+    private static CabArchive Open(Stream input, bool ownsInput)
+    {
+        var archive = new CabArchive(input, ownsInput);
         try
         {
-            await using (var output = new FileStream(
-                tempCab,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                bufferSize: 1024 * 64,
-                options: FileOptions.Asynchronous | FileOptions.SequentialScan))
+            archive._inputHandle = GCHandle.Alloc(input);
+            archive._inputToken = Native.Token(archive._inputHandle);
+
+            archive._cabd = Native.mspack_create_cab_decompressor(Native.System);
+            if (archive._cabd == IntPtr.Zero)
+                throw new CabinetStreamException("Could not create libmspack CAB decompressor.");
+
+            Native.LastException = null;
+            archive._cab = Native.CabdOpen(archive._cabd, archive._inputToken);
+            if (archive._cab == IntPtr.Zero)
             {
-                await stream.CopyToAsync(output, 1024 * 64, cancellationToken).ConfigureAwait(false);
+                throw new CabinetStreamException(
+                    $"Could not open CAB archive with libmspack. libmspack error: {Native.CabdLastError(archive._cabd)}",
+                    Native.LastException);
             }
 
-            var archive = new CabArchive(tempCab, deleteCabOnDispose: true);
-            archive.OpenNative();
             return archive;
         }
         catch
         {
-            TryDelete(tempCab);
+            archive.Release();
             throw;
         }
-    }
-
-    public static ValueTask<CabArchive> OpenAsync(
-        string path,
-        CancellationToken cancellationToken = default)
-    {
-        if (path is null)
-            throw new ArgumentNullException(nameof(path));
-
-        var archive = new CabArchive(path, deleteCabOnDispose: false);
-        archive.OpenNative();
-        return ValueTask.FromResult(archive);
     }
 
     public IEnumerable<CabEntry> Entries
@@ -94,84 +96,66 @@ public sealed class CabArchive : IAsyncDisposable
         }
     }
 
-    public async ValueTask<Stream> OpenEntryStreamAsync(
-        CabEntry entry,
-        CancellationToken cancellationToken = default)
+    public ValueTask<Stream> OpenEntryStreamAsync(CabEntry entry, CancellationToken cancellationToken = default)
     {
-        if (entry is null)
-            throw new ArgumentNullException(nameof(entry));
+        ArgumentNullException.ThrowIfNull(entry);
         if (!ReferenceEquals(entry.Archive, this))
             throw new ArgumentException("Entry belongs to a different archive.", nameof(entry));
 
-        return await OpenEntryStreamAsync(entry.NativeFile, entry.Name, cancellationToken).ConfigureAwait(false);
+        return OpenEntryStreamAsync(entry.NativeFile, entry.Name, entry.Length, cancellationToken);
     }
 
     internal async ValueTask<Stream> OpenEntryStreamAsync(
         IntPtr nativeFile,
         string entryName,
+        long length,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
 
-        if (_entryOpen)
-            throw new InvalidOperationException("Finish reading the current entry stream before opening another entry.");
+        // One extraction at a time: it owns the input stream position and the decompressor state.
+        if (_current is { Finished: false })
+            throw new InvalidOperationException("Finish reading or dispose the current entry stream before opening another entry.");
+        if (_extract is not null)
+            await _extract.ConfigureAwait(false);
 
-        _entryOpen = true;
+        var pipe = new Pipe();
+        _extract = Task.Factory.StartNew(
+            () => Extract(nativeFile, entryName, pipe.Writer),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
 
-        var tempOutput = Path.Combine(Path.GetTempPath(), "sharpcab-entry-" + Guid.NewGuid().ToString("N") + ".bin");
-        _tempFiles.Add(tempOutput);
+        return _current = new CabEntryStream(pipe.Reader, _extract, length);
+    }
 
-        IntPtr outputPathUtf8 = IntPtr.Zero;
-
+    // Runs on its own thread: libmspack pushes decompressed bytes into the pipe while the caller pulls from it.
+    private void Extract(IntPtr nativeFile, string entryName, PipeWriter writer)
+    {
+        var handle = GCHandle.Alloc(new PipeWriterStream(writer));
+        var token = Native.Token(handle);
+        Exception? error = null;
         try
         {
-            outputPathUtf8 = AllocUtf8(tempOutput);
-            int result = Native.CabdExtract(_cabd, nativeFile, outputPathUtf8);
-
+            Native.LastException = null;
+            int result = Native.CabdExtract(_cabd, nativeFile, token);
             if (result != 0)
             {
-                throw new CabinetStreamException(
-                    $"Could not extract CAB entry '{entryName}'. libmspack error: {result}");
+                error = new CabinetStreamException(
+                    $"Could not extract CAB entry '{entryName}'. libmspack error: {result}",
+                    Native.LastException);
             }
-
-            var stream = new DeleteOnDisposeFileStream(
-                tempOutput,
-                () =>
-                {
-                    _entryOpen = false;
-                    _tempFiles.Remove(tempOutput);
-                });
-
-            await Task.CompletedTask.ConfigureAwait(false);
-            return stream;
         }
-        catch
+        catch (Exception e)
         {
-            _entryOpen = false;
-            _tempFiles.Remove(tempOutput);
-            TryDelete(tempOutput);
-            throw;
+            error = e;
         }
         finally
         {
-            if (outputPathUtf8 != IntPtr.Zero)
-                Marshal.FreeHGlobal(outputPathUtf8);
-        }
-    }
-
-    private void OpenNative()
-    {
-        _cabPathUtf8 = AllocUtf8(_cabPath);
-
-        _cabd = Native.mspack_create_cab_decompressor(IntPtr.Zero);
-        if (_cabd == IntPtr.Zero)
-            throw new CabinetStreamException("Could not create libmspack CAB decompressor.");
-
-        _cab = Native.CabdOpen(_cabd, _cabPathUtf8);
-        if (_cab == IntPtr.Zero)
-        {
-            int error = Native.CabdLastError(_cabd);
-            throw new CabinetStreamException($"Could not open CAB archive with libmspack. libmspack error: {error}");
+            Marshal.FreeCoTaskMem(token);
+            handle.Free();
+            writer.Complete(error);
         }
     }
 
@@ -181,21 +165,22 @@ public sealed class CabArchive : IAsyncDisposable
             throw new ObjectDisposedException(nameof(CabArchive));
     }
 
-    private static IntPtr AllocUtf8(string value)
-    {
-        var bytes = Encoding.UTF8.GetBytes(value + "\0");
-        var ptr = Marshal.AllocHGlobal(bytes.Length);
-        Marshal.Copy(bytes, 0, ptr, bytes.Length);
-        return ptr;
-    }
-
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
         if (_disposed)
-            return ValueTask.CompletedTask;
+            return;
 
         _disposed = true;
 
+        _current?.Dispose(); // aborts a still-running extraction
+        if (_extract is not null)
+            await _extract.ConfigureAwait(false);
+
+        Release();
+    }
+
+    private void Release()
+    {
         if (_cab != IntPtr.Zero)
         {
             Native.CabdClose(_cabd, _cab);
@@ -208,33 +193,16 @@ public sealed class CabArchive : IAsyncDisposable
             _cabd = IntPtr.Zero;
         }
 
-        if (_cabPathUtf8 != IntPtr.Zero)
+        if (_inputToken != IntPtr.Zero)
         {
-            Marshal.FreeHGlobal(_cabPathUtf8);
-            _cabPathUtf8 = IntPtr.Zero;
+            Marshal.FreeCoTaskMem(_inputToken);
+            _inputToken = IntPtr.Zero;
         }
 
-        foreach (var temp in _tempFiles.ToArray())
-            TryDelete(temp);
+        if (_inputHandle.IsAllocated)
+            _inputHandle.Free();
 
-        _tempFiles.Clear();
-
-        if (_deleteCabOnDispose)
-            TryDelete(_cabPath);
-
-        return ValueTask.CompletedTask;
-    }
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            if (!string.IsNullOrEmpty(path) && File.Exists(path))
-                File.Delete(path);
-        }
-        catch
-        {
-            // best effort cleanup
-        }
+        if (_ownsInput)
+            _input.Dispose();
     }
 }
