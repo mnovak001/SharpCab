@@ -4,11 +4,12 @@
         <TargetFramework>net10.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
 
         <PackageId>SharpCab</PackageId>
         <Authors>Michal Novák</Authors>
-        <Description>.NET wrapper over CLI tool cabextract</Description>
+        <Description>.NET wrapper around libmspack: list and stream CAB archive entries without temp files</Description>
 
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
 
